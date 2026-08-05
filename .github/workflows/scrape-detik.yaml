@@ -1,0 +1,27 @@
+name: Scrape Detik News
+
+on:
+  schedule:
+    # Jalan tiap 15 menit. Catatan: GitHub tidak menjamin waktu presisi,
+    # terutama saat traffic tinggi bisa delay beberapa menit.
+    - cron: '*/15 * * * *'
+  # Supaya bisa di-trigger manual dari tab "Actions" di GitHub (buat testing)
+  workflow_dispatch:
+
+jobs:
+  trigger-scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call scrape endpoint
+        run: |
+          response=$(curl -s -o response.json -w "%{http_code}" \
+            "${{ vars.APP_URL }}/api/cron/scrape-detik?key=${{ secrets.CRON_SECRET }}")
+
+          echo "HTTP Status: $response"
+          echo "Response body:"
+          cat response.json
+
+          if [ "$response" -ne 200 ]; then
+            echo "Request gagal dengan status $response"
+            exit 1
+          fi
