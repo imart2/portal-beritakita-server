@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const cors = require('cors');
 
 require('dotenv').config();
 
@@ -14,6 +15,14 @@ const groq = new Groq({
 });
 
 const app = express();
+
+// Izinkan frontend di domain manapun untuk GET data (endpoint publik, read-only).
+// Kalau nanti mau dibatasi ke domain frontend tertentu saja, ganti origin: '*'
+// jadi origin: 'https://domain-frontend-anda.com'
+app.use(cors({
+    origin: '*',
+    methods: ['GET']
+}));
 
 // Pastikan koneksi MongoDB siap sebelum route diproses.
 // connectDB() sendiri sudah di-cache, jadi request berikutnya
