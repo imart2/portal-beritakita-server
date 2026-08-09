@@ -47,6 +47,12 @@ const articleSchema = new mongoose.Schema(
         date: String,
         tags: [String],
 
+        // Jumlah "dibaca" — bertambah tiap kali halaman detail dibuka
+        views: {
+            type: Number,
+            default: 0
+        },
+
         publishedText: String,
         publishedAt: String,
         unixTime: String
