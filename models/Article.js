@@ -39,6 +39,14 @@ const articleSchema = new mongoose.Schema(
             required: true
         },
 
+        // Kategori berita — diklasifikasi otomatis oleh AI saat proses rewrite
+        category: {
+            type: String,
+            enum: ['Politik', 'Hukum & Kriminal', 'Peristiwa', 'Internasional', 'Ekonomi', 'Sosial & Budaya', 'Lainnya'],
+            default: 'Lainnya',
+            index: true
+        },
+
         // Metadata
         image: String,
         caption: String,
