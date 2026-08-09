@@ -16,12 +16,34 @@ const groq = new Groq({
 
 const app = express();
 
+// URL frontend (bukan URL backend/API ini) — dipakai untuk membangun link
+// artikel di RSS feed & sitemap.xml. WAJIB di-set di Environment Variables
+// Vercel setelah frontend anda live, misal: https://sinyal-anda.vercel.app
+const FRONTEND_URL = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
+
+function escapeXml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
+}
+
+function articleDetailUrl(article) {
+    // Kalau FRONTEND_URL belum di-set, fallback ke placeholder supaya tetap
+    // menghasilkan XML yang valid (bukan crash), tapi linknya tidak akan berfungsi.
+    const base = FRONTEND_URL || 'https://ganti-dengan-domain-frontend-anda.com';
+    return `${base}/detail.html?id=${encodeURIComponent(article.detikId)}`;
+}
+
 // Izinkan frontend di domain manapun untuk GET data (endpoint publik, read-only).
 // Kalau nanti mau dibatasi ke domain frontend tertentu saja, ganti origin: '*'
 // jadi origin: 'https://domain-frontend-anda.com'
 app.use(cors({
     origin: '*',
-    methods: ['GET']
+    methods: ['GET', 'POST']
 }));
 
 // Pastikan koneksi MongoDB siap sebelum route diproses.
@@ -49,7 +71,7 @@ app.use(async (req, res, next) => {
 async function rewriteTitle(title) {
     try {
         const completion = await groq.chat.completions.create({
-            model: "openai/gpt-oss-120b",
+            model: "llama-3.1-8b-instant",
             temperature: 0.7,
             messages: [
                 {
@@ -85,7 +107,7 @@ async function rewriteTitle(title) {
 async function rewriteArticle(title, content) {
     try {
         const completion = await groq.chat.completions.create({
-            model: "openai/gpt-oss-120b",
+            model: "llama-3.1-8b-instant",
             temperature: 0.4,
             messages: [
                 {
@@ -422,13 +444,39 @@ app.get('/api/articles', async (req, res) => {
         const limit = Math.min(Number(req.query.limit) || 10, 50);
         const skip = (page - 1) * limit;
 
+        // ----- Filter: pencarian teks bebas -----
+        const query = {};
+        const searchTerm = (req.query.search || req.query.q || '').trim();
+        if (searchTerm) {
+            const regex = new RegExp(
+                searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), // escape karakter regex spesial
+                'i'
+            );
+            query.$or = [{ title: regex }, { content: regex }, { tags: regex }];
+        }
+
+        // ----- Filter: sumber berita -----
+        const source = (req.query.source || '').trim();
+        if (source) {
+            query.source = new RegExp(source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+        }
+
+        // ----- Sort -----
+        const sortMap = {
+            newest: { createdAt: -1 },
+            oldest: { createdAt: 1 },
+            most_viewed: { views: -1 }
+        };
+        const sortParam = (req.query.sort || 'newest').trim();
+        const sortBy = sortMap[sortParam] || sortMap.newest;
+
         const [articles, total] = await Promise.all([
-            Article.find({})
-                .sort({ createdAt: -1 })
+            Article.find(query)
+                .sort(sortBy)
                 .skip(skip)
                 .limit(limit)
                 .select('-originalTitle -originalContent -__v'),
-            Article.countDocuments({})
+            Article.countDocuments(query)
         ]);
 
         return res.json({
@@ -437,6 +485,9 @@ app.get('/api/articles', async (req, res) => {
             limit,
             total,
             totalPages: Math.ceil(total / limit),
+            search: searchTerm || null,
+            source: source || null,
+            sort: sortParam,
             data: articles
         });
     } catch (error) {
@@ -478,6 +529,137 @@ app.get('/api/articles/:detikId', async (req, res) => {
             success: false,
             message: error.message
         });
+    }
+});
+
+
+// =====================================
+// ENDPOINT: INCREMENT JUMLAH DIBACA
+// =====================================
+// Dipanggil frontend sekali tiap kali halaman detail artikel dibuka.
+// Pakai $inc supaya atomic (aman walau ada banyak pembaca bersamaan).
+
+app.post('/api/articles/:detikId/view', async (req, res) => {
+    try {
+        const { detikId } = req.params;
+
+        const article = await Article.findOneAndUpdate(
+            { detikId },
+            { $inc: { views: 1 } },
+            { new: true, select: 'detikId views' }
+        );
+
+        if (!article) {
+            return res.status(404).json({
+                success: false,
+                message: 'Artikel tidak ditemukan'
+            });
+        }
+
+        return res.json({
+            success: true,
+            data: { detikId: article.detikId, views: article.views }
+        });
+    } catch (error) {
+        console.error(error);
+
+        return res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// =====================================
+// RSS FEED
+// =====================================
+
+app.get('/rss.xml', async (req, res) => {
+    try {
+        const articles = await Article.find({})
+            .sort({ createdAt: -1 })
+            .limit(30)
+            .select('detikId title caption content author date createdAt');
+
+        const items = articles.map((article) => {
+            const link = articleDetailUrl(article);
+            const pubDate = new Date(article.createdAt).toUTCString();
+            const description = escapeXml(
+                (article.caption || article.content || '').replace(/\s+/g, ' ').trim().slice(0, 300)
+            );
+
+            return `
+    <item>
+      <title>${escapeXml(article.title)}</title>
+      <link>${escapeXml(link)}</link>
+      <guid isPermaLink="true">${escapeXml(link)}</guid>
+      <pubDate>${pubDate}</pubDate>
+      <author>${escapeXml(article.author || 'Redaksi')}</author>
+      <description>${description}</description>
+    </item>`;
+        }).join('');
+
+        const siteUrl = FRONTEND_URL || 'https://ganti-dengan-domain-frontend-anda.com';
+
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>SINYAL — Kabar Teknologi Dunia &amp; Indonesia</title>
+    <link>${escapeXml(siteUrl)}</link>
+    <description>Berita teknologi terkini hasil rangkuman AI dari berbagai sumber terpercaya.</description>
+    <language>id-ID</language>
+    <lastBuildDate>${new Date().toUTCString()}</lastBuildDate>${items}
+  </channel>
+</rss>`;
+
+        res.set('Content-Type', 'application/rss+xml; charset=utf-8');
+        return res.send(xml);
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+
+// =====================================
+// SITEMAP.XML
+// =====================================
+
+app.get('/sitemap.xml', async (req, res) => {
+    try {
+        const articles = await Article.find({})
+            .sort({ createdAt: -1 })
+            .limit(1000)
+            .select('detikId createdAt updatedAt');
+
+        const siteUrl = FRONTEND_URL || 'https://ganti-dengan-domain-frontend-anda.com';
+
+        const staticUrls = [
+            { loc: `${siteUrl}/index.html`, lastmod: new Date().toISOString() }
+        ];
+
+        const articleUrls = articles.map((article) => ({
+            loc: articleDetailUrl(article),
+            lastmod: new Date(article.updatedAt || article.createdAt).toISOString()
+        }));
+
+        const allUrls = [...staticUrls, ...articleUrls];
+
+        const urlEntries = allUrls.map((u) => `
+  <url>
+    <loc>${escapeXml(u.loc)}</loc>
+    <lastmod>${u.lastmod}</lastmod>
+  </url>`).join('');
+
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urlEntries}
+</urlset>`;
+
+        res.set('Content-Type', 'application/xml; charset=utf-8');
+        return res.send(xml);
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ success: false, message: error.message });
     }
 });
 
