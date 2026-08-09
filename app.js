@@ -103,11 +103,35 @@ async function rewriteTitle(title) {
     }
 }
 
-// REWRITE ARTICLE WITH AI FROM GROQ
-async function rewriteArticle(title, content) {
+// Daftar kategori yang boleh dipilih AI — disesuaikan dengan cakupan asli
+// news.detik.com/indeks (bukan daftar generik)
+const ARTICLE_CATEGORIES = [
+    'Politik',
+    'Hukum & Kriminal',
+    'Peristiwa',
+    'Internasional',
+    'Ekonomi',
+    'Sosial & Budaya',
+    'Lainnya'
+];
+
+// Buang markdown code fence (```json ... ```) kalau model membungkusnya,
+// lalu coba parse sebagai JSON. Return null kalau gagal (bukan JSON valid).
+function parseJsonSafely(raw) {
+    try {
+        const cleaned = raw.replace(/^```json\s*|^```\s*|```\s*$/gim, '').trim();
+        return JSON.parse(cleaned);
+    } catch {
+        return null;
+    }
+}
+
+// REWRITE ARTIKEL + KLASIFIKASI KATEGORI SEKALIGUS (1 pemanggilan Groq saja,
+// bukan 2 — supaya tidak menambah pemakaian token untuk fitur kategori ini)
+async function rewriteArticleWithCategory(title, content) {
     try {
         const completion = await groq.chat.completions.create({
-            model: "llama-3.1-8b-instant",
+            model: "openai/gpt-oss-120b",
             temperature: 0.4,
             messages: [
                 {
@@ -115,10 +139,11 @@ async function rewriteArticle(title, content) {
                     content: `
                     Anda adalah editor senior media berita Indonesia.
 
-                    Tugas Anda adalah menulis ulang artikel berita.
+                    Tugas Anda ADA DUA:
+                    1. Menulis ulang artikel berita.
+                    2. Menentukan SATU kategori paling sesuai untuk artikel ini.
 
-                    PERATURAN:
-
+                    PERATURAN PENULISAN ULANG:
                     - Jangan mengubah fakta.
                     - Jangan menambah informasi baru.
                     - Jangan menghapus informasi penting.
@@ -132,7 +157,16 @@ async function rewriteArticle(title, content) {
                     - Gunakan transisi yang natural.
                     - Ringkas menjadi sekitar 70-80% dari artikel asli.
                     - Tetap mempertahankan kronologi berita.
-                    - Output HANYA isi artikel.
+                    - Isi artikel dalam teks biasa (bukan markdown), antar paragraf dipisah baris baru ganda (\\n\\n).
+
+                    PERATURAN KATEGORI:
+                    - Pilih TEPAT SATU dari daftar berikut, tulis PERSIS seperti tertulis (termasuk huruf besar/kecil dan tanda "&"):
+                      ${ARTICLE_CATEGORIES.join(', ')}
+                    - Kalau tidak yakin atau tidak cocok kategori manapun, pilih "Lainnya".
+
+                    FORMAT OUTPUT — WAJIB DIIKUTI:
+                    Kembalikan HANYA satu objek JSON valid, TANPA teks lain, TANPA markdown code fence, persis format berikut:
+                    {"content": "isi artikel hasil rewrite di sini", "category": "salah satu dari daftar kategori"}
 `
                 },
                 {
@@ -148,11 +182,22 @@ async function rewriteArticle(title, content) {
             ]
         });
 
-        return completion.choices[0].message.content.trim();
+        const raw = completion.choices[0].message.content.trim();
+        const parsed = parseJsonSafely(raw);
+
+        if (parsed && typeof parsed.content === 'string' && parsed.content.trim()) {
+            const category = ARTICLE_CATEGORIES.includes(parsed.category) ? parsed.category : 'Lainnya';
+            return { content: parsed.content.trim(), category };
+        }
+
+        // Fallback: model tidak mengikuti format JSON — anggap seluruh
+        // respons adalah isi artikel apa adanya, kategori default "Lainnya"
+        console.warn('Respons rewrite bukan JSON valid, pakai fallback.');
+        return { content: raw, category: 'Lainnya' };
 
     } catch (err) {
         console.error(err);
-        return content;
+        return { content, category: 'Lainnya' };
     }
 }
 
@@ -227,9 +272,9 @@ async function scrapeDetikList(page = 1) {
 }
 
 // Ambil detail 1 artikel (tanpa rewrite, tanpa simpan)
-async function scrapeDetikDetail(detikId, slug) {
-    const articleUrl = `https://news.detik.com/berita/${detikId}/${slug}`;
-
+// Menerima URL ASLI hasil scrape list (bukan direkonstruksi manual), karena
+// path artikel detik.com bisa beda-beda tergantung kanal (/berita/, /x/, dll)
+async function scrapeDetikDetail(articleUrl) {
     const { data } = await axios.get(articleUrl, {
         headers: {
             'User-Agent':
@@ -367,8 +412,8 @@ app.get('/api/cron/scrape-detik', checkCronSecret, async (req, res) => {
             });
         }
 
-        // Scrape detail
-        const detail = await scrapeDetikDetail(latest.detikId, latest.slug);
+        // Scrape detail — pakai URL asli hasil scrape list
+        const detail = await scrapeDetikDetail(latest.url);
 
         if (!detail.title || !detail.content) {
             return res.status(500).json({
@@ -377,11 +422,11 @@ app.get('/api/cron/scrape-detik', checkCronSecret, async (req, res) => {
             });
         }
 
-        // Rewrite dengan AI (title & content diproses paralel untuk mempercepat,
-        // penting di Vercel karena ada batas waktu eksekusi function)
-        const [rewrittenTitle, rewrittenContent] = await Promise.all([
+        // Rewrite dengan AI (title & content+kategori diproses paralel untuk
+        // mempercepat, penting di Vercel karena ada batas waktu eksekusi function)
+        const [rewrittenTitle, rewriteResult] = await Promise.all([
             rewriteTitle(detail.title),
-            rewriteArticle(detail.title, detail.content)
+            rewriteArticleWithCategory(detail.title, detail.content)
         ]);
 
         // Simpan ke MongoDB
@@ -394,7 +439,8 @@ app.get('/api/cron/scrape-detik', checkCronSecret, async (req, res) => {
             title: rewrittenTitle,
 
             originalContent: detail.content,
-            content: rewrittenContent,
+            content: rewriteResult.content,
+            category: rewriteResult.category,
 
             image: detail.image || latest.image,
             caption: detail.caption,
@@ -461,6 +507,12 @@ app.get('/api/articles', async (req, res) => {
             query.source = new RegExp(source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
         }
 
+        // ----- Filter: kategori -----
+        const category = (req.query.category || '').trim();
+        if (category) {
+            query.category = category;
+        }
+
         // ----- Sort -----
         const sortMap = {
             newest: { createdAt: -1 },
@@ -487,6 +539,7 @@ app.get('/api/articles', async (req, res) => {
             totalPages: Math.ceil(total / limit),
             search: searchTerm || null,
             source: source || null,
+            category: category || null,
             sort: sortParam,
             data: articles
         });
@@ -604,9 +657,9 @@ app.get('/rss.xml', async (req, res) => {
         const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
   <channel>
-    <title>SINYAL — Kabar Teknologi Dunia &amp; Indonesia</title>
+    <title>SINYAL — Kabar Terkini Dunia &amp; Indonesia</title>
     <link>${escapeXml(siteUrl)}</link>
-    <description>Berita teknologi terkini hasil rangkuman AI dari berbagai sumber terpercaya.</description>
+    <description>Berita terkini hasil rangkuman AI dari berbagai sumber terpercaya.</description>
     <language>id-ID</language>
     <lastBuildDate>${new Date().toUTCString()}</lastBuildDate>${items}
   </channel>
