@@ -7,6 +7,7 @@ require('dotenv').config();
 
 const connectDB = require('./lib/db');
 const Article = require('./models/Article');
+const Comment = require('./models/Comment');
 
 const Groq = require("groq-sdk");
 
@@ -45,6 +46,7 @@ app.use(cors({
     origin: '*',
     methods: ['GET', 'POST']
 }));
+app.use(express.json());
 
 // Pastikan koneksi MongoDB siap sebelum route diproses.
 // connectDB() sendiri sudah di-cache, jadi request berikutnya
@@ -71,7 +73,7 @@ app.use(async (req, res, next) => {
 async function rewriteTitle(title) {
     try {
         const completion = await groq.chat.completions.create({
-            model: "openai/gpt-oss-120b",
+            model: "llama-3.1-8b-instant",
             temperature: 0.7,
             messages: [
                 {
@@ -131,7 +133,7 @@ function parseJsonSafely(raw) {
 async function rewriteArticleWithCategory(title, content) {
     try {
         const completion = await groq.chat.completions.create({
-            model: "openai/gpt-oss-120b",
+            model: "llama-3.1-8b-instant",
             temperature: 0.4,
             messages: [
                 {
@@ -361,6 +363,33 @@ function checkCronSecret(req, res, next) {
     }
 
     const provided = req.headers['x-cron-secret'] || req.query.key;
+
+    if (provided !== secret) {
+        return res.status(401).json({
+            success: false,
+            message: 'Unauthorized'
+        });
+    }
+
+    next();
+}
+
+
+// =====================================
+// MIDDLEWARE: PROTEKSI MODERASI KOMENTAR
+// =====================================
+
+function checkAdminSecret(req, res, next) {
+    const secret = process.env.ADMIN_SECRET;
+
+    if (!secret) {
+        return res.status(500).json({
+            success: false,
+            message: 'ADMIN_SECRET belum di-set di server'
+        });
+    }
+
+    const provided = req.headers['x-admin-secret'] || req.query.key;
 
     if (provided !== secret) {
         return res.status(401).json({
@@ -620,6 +649,151 @@ app.post('/api/articles/:detikId/view', async (req, res) => {
             success: false,
             message: error.message
         });
+    }
+});
+
+
+// =====================================
+// KOMENTAR — PUBLIK
+// =====================================
+
+// Ambil komentar yang SUDAH disetujui untuk 1 artikel
+app.get('/api/articles/:detikId/comments', async (req, res) => {
+    try {
+        const { detikId } = req.params;
+
+        const comments = await Comment.find({ articleId: detikId, status: 'approved' })
+            .sort({ createdAt: -1 })
+            .select('name content createdAt');
+
+        return res.json({
+            success: true,
+            total: comments.length,
+            data: comments
+        });
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Kirim komentar baru — otomatis berstatus "pending", tidak langsung tampil
+app.post('/api/articles/:detikId/comments', async (req, res) => {
+    try {
+        const { detikId } = req.params;
+        const { name, content, website } = req.body || {};
+
+        // Honeypot: field "website" seharusnya kosong. Kalau terisi, hampir
+        // pasti itu bot (manusia tidak melihat field ini di form).
+        if (website) {
+            // Pura-pura sukses supaya bot tidak tahu ditolak, tapi tidak disimpan
+            return res.json({ success: true, message: 'Komentar terkirim, menunggu moderasi.' });
+        }
+
+        const trimmedName = (name || '').toString().trim();
+        const trimmedContent = (content || '').toString().trim();
+
+        if (!trimmedName || !trimmedContent) {
+            return res.status(400).json({ success: false, message: 'Nama dan komentar wajib diisi.' });
+        }
+        if (trimmedName.length > 60) {
+            return res.status(400).json({ success: false, message: 'Nama terlalu panjang (maksimal 60 karakter).' });
+        }
+        if (trimmedContent.length < 3) {
+            return res.status(400).json({ success: false, message: 'Komentar terlalu pendek.' });
+        }
+        if (trimmedContent.length > 1000) {
+            return res.status(400).json({ success: false, message: 'Komentar terlalu panjang (maksimal 1000 karakter).' });
+        }
+
+        const article = await Article.findOne({ detikId }).select('detikId');
+        if (!article) {
+            return res.status(404).json({ success: false, message: 'Artikel tidak ditemukan.' });
+        }
+
+        // Rate limit sederhana: 1 komentar per 30 detik dari IP yang sama
+        const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString().split(',')[0].trim();
+        if (ip) {
+            const recentComment = await Comment.findOne({
+                ip,
+                createdAt: { $gte: new Date(Date.now() - 30 * 1000) }
+            });
+            if (recentComment) {
+                return res.status(429).json({
+                    success: false,
+                    message: 'Anda baru saja mengirim komentar. Coba lagi sebentar.'
+                });
+            }
+        }
+
+        await Comment.create({
+            articleId: detikId,
+            name: trimmedName,
+            content: trimmedContent,
+            ip: ip || undefined,
+            status: 'pending'
+        });
+
+        return res.json({
+            success: true,
+            message: 'Komentar terkirim, menunggu moderasi sebelum tayang. Terima kasih!'
+        });
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+
+// =====================================
+// KOMENTAR — MODERASI (dilindungi ADMIN_SECRET)
+// =====================================
+
+// Daftar komentar berdasarkan status (default: pending)
+app.get('/api/admin/comments', checkAdminSecret, async (req, res) => {
+    try {
+        const status = ['pending', 'approved', 'rejected'].includes(req.query.status)
+            ? req.query.status
+            : 'pending';
+
+        const comments = await Comment.find({ status })
+            .sort({ createdAt: -1 })
+            .limit(200);
+
+        return res.json({ success: true, total: comments.length, data: comments });
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+app.post('/api/admin/comments/:id/approve', checkAdminSecret, async (req, res) => {
+    try {
+        const comment = await Comment.findByIdAndUpdate(
+            req.params.id,
+            { status: 'approved' },
+            { new: true }
+        );
+        if (!comment) return res.status(404).json({ success: false, message: 'Komentar tidak ditemukan.' });
+        return res.json({ success: true, data: comment });
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+app.post('/api/admin/comments/:id/reject', checkAdminSecret, async (req, res) => {
+    try {
+        const comment = await Comment.findByIdAndUpdate(
+            req.params.id,
+            { status: 'rejected' },
+            { new: true }
+        );
+        if (!comment) return res.status(404).json({ success: false, message: 'Komentar tidak ditemukan.' });
+        return res.json({ success: true, data: comment });
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ success: false, message: error.message });
     }
 });
 
