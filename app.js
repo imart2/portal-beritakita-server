@@ -73,7 +73,7 @@ app.use(async (req, res, next) => {
 async function rewriteTitle(title) {
     try {
         const completion = await groq.chat.completions.create({
-            model: "llama-3.1-8b-instant",
+            model: "openai/gpt-oss-120b",
             temperature: 0.7,
             messages: [
                 {
@@ -133,7 +133,7 @@ function parseJsonSafely(raw) {
 async function rewriteArticleWithCategory(title, content) {
     try {
         const completion = await groq.chat.completions.create({
-            model: "llama-3.1-8b-instant",
+            model: "openai/gpt-oss-120b",
             temperature: 0.4,
             messages: [
                 {
