@@ -44,7 +44,7 @@ function articleDetailUrl(article) {
 // jadi origin: 'https://domain-frontend-anda.com'
 app.use(cors({
     origin: '*',
-    methods: ['GET', 'POST']
+    methods: ['GET', 'POST', 'DELETE']
 }));
 app.use(express.json());
 
@@ -73,7 +73,7 @@ app.use(async (req, res, next) => {
 async function rewriteTitle(title) {
     try {
         const completion = await groq.chat.completions.create({
-            model: "openai/gpt-oss-120b",
+            model: "llama-3.1-8b-instant",
             temperature: 0.7,
             messages: [
                 {
@@ -133,7 +133,7 @@ function parseJsonSafely(raw) {
 async function rewriteArticleWithCategory(title, content) {
     try {
         const completion = await groq.chat.completions.create({
-            model: "openai/gpt-oss-120b",
+            model: "llama-3.1-8b-instant",
             temperature: 0.4,
             messages: [
                 {
@@ -791,6 +791,41 @@ app.post('/api/admin/comments/:id/reject', checkAdminSecret, async (req, res) =>
         );
         if (!comment) return res.status(404).json({ success: false, message: 'Komentar tidak ditemukan.' });
         return res.json({ success: true, data: comment });
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+
+// =====================================
+// ARTIKEL — MODERASI (dilindungi ADMIN_SECRET)
+// =====================================
+
+// Hapus 1 artikel secara manual (dipakai halaman admin.html).
+// Komentar yang terkait artikel ini ikut dihapus, supaya tidak ada
+// komentar "nyasar" yang nunjuk ke artikel yang sudah tidak ada.
+app.delete('/api/admin/articles/:detikId', checkAdminSecret, async (req, res) => {
+    try {
+        const { detikId } = req.params;
+
+        const article = await Article.findOneAndDelete({ detikId });
+
+        if (!article) {
+            return res.status(404).json({ success: false, message: 'Artikel tidak ditemukan.' });
+        }
+
+        const deletedComments = await Comment.deleteMany({ articleId: detikId });
+
+        return res.json({
+            success: true,
+            message: 'Artikel berhasil dihapus.',
+            data: {
+                detikId: article.detikId,
+                title: article.title,
+                deletedComments: deletedComments.deletedCount || 0
+            }
+        });
     } catch (error) {
         console.error(error);
         return res.status(500).json({ success: false, message: error.message });
